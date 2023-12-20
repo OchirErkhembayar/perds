@@ -4,6 +4,8 @@
 //! I am starting off an initial prototype to only
 //! work with [std::collections::HashMap] and will
 //! move on to other data structures later
+//!
+//! TODO: Error handling, currently there are just units for Ok and Err variants of Result
 
 use std::{collections::HashMap, hash::Hash, sync::mpsc::channel, thread, thread::JoinHandle};
 
@@ -12,6 +14,8 @@ use std::{collections::HashMap, hash::Hash, sync::mpsc::channel, thread, thread:
 pub struct Perds<K, V> {
     inner: HashMap<K, V>,
     strategy: Strategy,
+    // TODO: This is not ideal because we have to unwrap. Probably best to just make it always
+    // available and have a dummy variant or something
     data: Option<Data>,
 }
 
@@ -86,6 +90,13 @@ where
             data.as_mut().unwrap().save()?;
         }
         Ok(())
+    }
+
+    fn save(&mut self) -> Result<(), ()> {
+        match self.strategy {
+            Strategy::Stream | Strategy::Manual => self.data.as_mut().unwrap().save(),
+            Strategy::InMemory => Ok(()),
+        }
     }
 }
 
