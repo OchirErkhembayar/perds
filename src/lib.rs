@@ -13,33 +13,27 @@
 //! - How to compress the file
 //! - ...
 //!
+//! Plan:
+//! - Keys are strings
+//! - Values are serializable data format not chosen
+//!
+
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use std::{
-    any::TypeId,
     collections::HashMap,
+    fmt::Debug,
     fs::{File, OpenOptions},
     hash::Hash,
     io::{BufWriter, Read, Write},
-    path::{Path, PathBuf},
-    sync::mpsc::{channel, Sender},
-    thread,
-    thread::JoinHandle,
+    path::PathBuf,
 };
 
 /// The persistent container for a std library collection type
 #[derive(Debug)]
 pub struct Perds<K, V> {
     strategy: Strategy,
-    inner: Data<K, V>,
-}
-
-/// The representation of the persistence mechanism of the
-/// inner data structure
-#[derive(Debug)]
-struct Data<K, V> {
-    task: JoinHandle<()>,
     inner: HashMap<K, V>,
-    tx: Sender<Cmd>,
     writer: BufWriter<File>,
 }
 
@@ -52,18 +46,12 @@ pub enum Strategy {
     Stream(PathBuf),
     /// Save only when calling ___
     Manual(PathBuf),
-    /// Save at a specified interval in ms
-    ///
-    /// This increases chance of data loss and is more dependent
-    /// on a graceful shutdown but can be much more performant
-    /// when updated are very frequent
-    Interval(PathBuf, u32),
 }
 
-#[derive(Debug)]
-enum Cmd {
-    /// Add an entry to the append only file
-    Append,
+#[derive(Serialize, Deserialize)]
+enum Operation {
+    Insert,
+    Delete,
 }
 
 /// All errors related to the Perds crate
@@ -73,6 +61,8 @@ enum Cmd {
 pub enum Error {
     /// All errors related to file IO
     FileError(std::io::Error),
+    /// Serialization/Deserialization failure
+    SerError(postcard::Error),
 }
 
 impl From<std::io::Error> for Error {
@@ -81,53 +71,9 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl<K, V> Data<K, V> {
-    /// This will start a background worker which will listen to
-    /// IO events.
-    ///
-    /// The most common use case for it will be to check the size of the
-    /// append only file and update the snapshot then compress the file
-    /// once it reaches a large enough size
-    fn start(value: HashMap<K, V>, writer: BufWriter<File>) -> Self {
-        let (tx, rx) = channel::<Cmd>();
-        let task = thread::spawn(move || loop {
-            if let Ok(cmd) = rx.recv() {
-                println!("Command: {:?}", cmd);
-            }
-        });
-        Self {
-            task,
-            writer,
-            inner: value,
-            tx,
-        }
-    }
-
-    fn save(&self) -> Result<(), ()> {
-        Ok(())
-    }
-
-    fn append(&mut self, key: K, val: V) -> Result<(), Error> {
-        self.writer.write_all(&[1])?;
-        self.writer.flush()?;
-        Ok(())
-    }
-}
-
-impl<K, V> Data<K, V>
-where
-    K: Hash + Eq,
-{
-    fn set(&mut self, key: K, value: V, strategy: Strategy) -> Result<(), ()> {
-        self.inner.insert(key, value);
-        if strategy != Strategy::InMemory {
-            self.save()?;
-        }
-        Ok(())
-    }
-
-    fn get(&self, key: &K) -> Option<&V> {
-        self.inner.get(key)
+impl From<postcard::Error> for Error {
+    fn from(value: postcard::Error) -> Self {
+        Error::SerError(value)
     }
 }
 
@@ -139,7 +85,59 @@ impl<K, V> Drop for Perds<K, V> {
 
 impl<K, V> Perds<K, V>
 where
-    K: Hash + Eq,
+    K: Eq + Hash + DeserializeOwned,
+    V: DeserializeOwned,
+{
+    /// Hydrate a Perds from data in a provided file path
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the append only file we want to hydrate from
+    ///
+    /// # Example
+    ///
+    /// ```
+    ///  use perds::Perds;
+    /// ```
+    pub fn from_file(strategy: Strategy) -> Result<Self, Error> {
+        let path = match &strategy {
+            Strategy::Manual(path) | Strategy::Stream(path) => path,
+            _ => panic!("Cannot use non persistent strategy"),
+        };
+        let mut f = File::open(path)?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        let mut map = HashMap::new();
+        let mut buf = buf.as_slice();
+        loop {
+            let (op, rest) = postcard::take_from_bytes::<Operation>(&buf)?;
+            buf = rest;
+            let (k, rest) = postcard::take_from_bytes::<K>(&buf)?;
+            buf = rest;
+            match op {
+                Operation::Delete => map.remove(&k),
+                Operation::Insert => {
+                    let (v, rest) = postcard::take_from_bytes::<V>(&buf)?;
+                    buf = rest;
+                    map.insert(k, v)
+                }
+            };
+            if buf.is_empty() {
+                break;
+            }
+        }
+        Ok(Self {
+            strategy,
+            inner: map,
+            writer: BufWriter::new(f),
+        })
+    }
+}
+
+impl<K, V> Perds<K, V>
+where
+    K: Hash + Eq + Serialize + Clone,
+    V: Serialize + Clone,
 {
     /// Instantiate a new Perds instance with a given strategy
     ///
@@ -158,51 +156,32 @@ where
         };
         Ok(Self {
             strategy,
-            inner: Data::start(value, writer),
+            inner: value,
+            writer,
         })
     }
 
-    /// Hydrate a Perds from data in a provided file path
+    /// Get the value from the HashMap
     ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the append only file we want to hydrate from
-    pub fn from_file(path: &Path) -> Result<Self, Error> {
-        let mut f = File::open(path)?;
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
-        let mut _map: HashMap<K, V> = HashMap::new();
-        buf.iter().for_each(|_l| {
-            // First byte +/- (insert or delete)
-            // Next byte data type of key
-            // Next byte data type of value
-            // From this we know how much to seek for each one
-            // For now assume no padding between statements
-        });
-        todo!();
-    }
-
-    fn get(&self, key: &K) -> Option<&V> {
+    /// This is a simple wrapper around `HashMap::get(...)`
+    pub fn get(&self, key: &K) -> Option<&V> {
         self.inner.get(key)
     }
 
-    fn set(&mut self, key: K, value: V) -> Result<(), ()> {
-        self.inner.append(key, value);
-        Ok(())
-    }
-
-    fn save(&mut self) -> Result<(), ()> {
+    /// Set a value in the HashMap
+    ///
+    /// This will use the persistence strategy chosen for the instance of `Perds`
+    pub fn set(&mut self, k: K, v: V) -> Result<(), Error> {
         match self.strategy {
-            // TODO: Handle these properly
             Strategy::Stream(_) => {
-                todo!();
+                let pair = postcard::to_stdvec(&(Operation::Insert, k.clone(), v.clone()))?;
+                self.writer.write_all(pair.as_slice())?;
+                self.writer.flush()?;
             }
-            Strategy::Manual(_) | Strategy::Interval(_, _) => {
-                todo!();
-            }
-            Strategy::InMemory => {}
+            Strategy::Manual(_) | Strategy::InMemory => {}
         };
-        todo!();
+        self.inner.insert(k, v);
+        Ok(())
     }
 }
 
@@ -212,8 +191,9 @@ mod tests {
 
     use super::*;
 
-    const TEST_FILE: &str = "./test/test.data";
-    const APPEND_FILE: &str = "./test/append.data";
+    const TEST_FILE: &str = "./test/test.postcard";
+    const APPEND_FILE: &str = "./test/append.postcard";
+    const HYDRATE_FILE: &str = "./test/hydrate.postcard";
 
     #[test]
     fn test_get_hashmap() {
@@ -243,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_append() {
-        let map: HashMap<&str, &str> = HashMap::from_iter([("key", "value")]);
+        let map: HashMap<&str, &str> = HashMap::new();
 
         let mut perds = Perds::new(
             map.clone(),
@@ -251,9 +231,30 @@ mod tests {
         )
         .unwrap();
 
-        perds.set("new key", "new value").unwrap();
+        perds.set("abc", "def").unwrap();
 
         println!("File: {:?}", std::fs::read(APPEND_FILE).unwrap());
-        assert_eq!(&[1], std::fs::read(APPEND_FILE).unwrap().as_slice())
+        assert_eq!(
+            &[0, 3, 97, 98, 99, 3, 100, 101, 102],
+            std::fs::read(APPEND_FILE).unwrap().as_slice()
+        )
+    }
+
+    #[test]
+    fn test_hydrate() {
+        {
+            let mut perds = Perds::new(
+                HashMap::new(),
+                Strategy::Stream(PathBuf::from_str(HYDRATE_FILE).unwrap()),
+            )
+            .unwrap();
+            perds.set("hello".to_string(), "world".to_string()).unwrap();
+            perds.set("bye".to_string(), "world".to_string()).unwrap();
+        }
+        let perds =
+            Perds::from_file(Strategy::Stream(PathBuf::from_str(HYDRATE_FILE).unwrap())).unwrap();
+
+        assert_eq!(perds.get(&"hello".to_string()), Some(&"world".to_string()));
+        assert_eq!(perds.get(&"bye".to_string()), Some(&"world".to_string()));
     }
 }
