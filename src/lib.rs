@@ -28,6 +28,9 @@ use std::{
 };
 
 /// The persistent container for a std library collection type
+///
+/// We don't derive clone because sharing the HashMap would be
+/// too expensive
 #[derive(Debug)]
 pub struct Perds<K, V> {
     strategy: Strategy,
@@ -88,6 +91,8 @@ where
 {
     /// Hydrate a Perds from data in a provided file path
     ///
+    /// This function will create a file if one does no exist
+    ///
     /// # Arguments
     ///
     /// * `path` - Path to the append only file we want to hydrate from
@@ -104,56 +109,8 @@ where
     ///  assert_eq!(p.get(&"foo".to_string()), None);
     /// ```
     pub fn from_file(strategy: Strategy, path: PathBuf) -> Result<Self, Error> {
-        let mut f = File::open(&path)?;
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
-        let mut map = HashMap::new();
-        let mut buf = buf.as_slice();
-        while !buf.is_empty() {
-            let (op, rest) = postcard::take_from_bytes::<Operation>(buf)?;
-            buf = rest;
-            let (k, rest) = postcard::take_from_bytes::<K>(buf)?;
-            buf = rest;
-            match op {
-                Operation::Delete => map.remove(&k),
-                Operation::Insert => {
-                    let (v, rest) = postcard::take_from_bytes::<V>(buf)?;
-                    buf = rest;
-                    map.insert(k, v)
-                }
-            };
-        }
-        Ok(Self {
-            strategy,
-            inner: map,
-            writer: BufWriter::new(f),
-            path,
-        })
-    }
-
-    /// Hydrate a Perds from data in a provided file path
-    ///
-    /// This function will create a file if one does no exist
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the append only file we want to hydrate from
-    ///
-    /// # Example
-    ///
-    /// ```
-    ///  use perds::{Perds, Strategy};
-    ///  use std::str::FromStr;
-    ///
-    ///  let path = std::path::PathBuf::from_str("./examples/doc.postcard").unwrap();
-    ///  let p: Perds<String, String> = Perds::try_from_file(Strategy::Stream, path).unwrap();
-    ///
-    ///  assert_eq!(p.get(&"foo".to_string()), None);
-    /// ```
-    pub fn try_from_file(strategy: Strategy, path: PathBuf) -> Result<Self, Error> {
         let mut f = File::options().write(true).read(true).open(&path)?;
         let mut buf = Vec::new();
-        eprintln!("Here? f: {:?}", f);
         f.read_to_end(&mut buf)?;
         let mut inner = HashMap::new();
         let mut buf = buf.as_slice();
